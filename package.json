@@ -1,0 +1,31 @@
+{
+  "name": "liftinglens",
+  "version": "1.0.0",
+  "description": "Mobile-first powerlifting bar velocity analyzer",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "clsx": "^2.1.1",
+    "idb": "^8.0.0",
+    "lucide-react": "^0.460.0",
+    "papaparse": "^5.4.1",
+    "recharts": "^2.13.3",
+    "xlsx": "^0.18.5",
+    "zod": "^3.23.8",
+    "zustand": "^5.0.2"
+  },
+  "devDependencies": {
+    "@types/papaparse": "^5.3.14",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.3",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "typescript": "^5.6.3",
+    "vite": "^6.0.3"
+  }
+}

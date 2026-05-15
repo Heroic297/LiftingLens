@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm create *)",
+      "Bash(echo '{}')",
+      "Bash(npm init *)",
+      "Bash(npm install *)",
+      "Bash(npm run *)",
+      "Bash(Start-Process npm *)",
+      "Bash(Start-Sleep 3)",
+      "Bash(Write-Output \"started\")"
+    ]
+  }
+}
