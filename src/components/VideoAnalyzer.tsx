@@ -101,7 +101,12 @@ export function VideoAnalyzer({ onComplete }: VideoAnalyzerProps) {
       setStage('extracting');
       setStageLabel('Extracting frames…');
       const frames = await extractFrames(recordedBlob, settings.sampleRate, (pct) => setAnalysisProgress(pct * 0.5));
-      if (frames.length < 5) throw new Error('Video too short — record at least a couple of seconds.');
+      if (frames.length === 0) {
+        throw new Error('Could not extract frames from the recording. Your browser may not support seeking this video format — try a different browser or re-record.');
+      }
+      if (frames.length < 5) {
+        throw new Error(`Only ${frames.length} frame(s) extracted — the video may be very short or corrupted. Try re-recording for at least 3–5 seconds.`);
+      }
 
       setStage('detecting');
       setStageLabel('Auto-detecting bar…');

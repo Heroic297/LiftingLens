@@ -4,6 +4,32 @@ export interface ExtractedFrame {
   index: number;
 }
 
+/**
+ * MediaRecorder-produced WebM blobs are missing duration metadata, so
+ * `video.duration` returns Infinity. We force the browser to seek past the
+ * end, which makes it expose the real duration on the next 'seeked' event.
+ */
+async function getRealDuration(video: HTMLVideoElement): Promise<number> {
+  if (isFinite(video.duration) && video.duration > 0) return video.duration;
+
+  return new Promise<number>((resolve) => {
+    const onSeeked = () => {
+      const d = video.duration;
+      video.removeEventListener('seeked', onSeeked);
+      video.currentTime = 0;
+      // After the duration is exposed, seek back to 0 and wait for that to land
+      const onBack = () => {
+        video.removeEventListener('seeked', onBack);
+        resolve(isFinite(d) && d > 0 ? d : 0);
+      };
+      video.addEventListener('seeked', onBack, { once: true });
+    };
+    video.addEventListener('seeked', onSeeked, { once: true });
+    // Seek to a very large time — browser clamps to actual end
+    video.currentTime = 1e9;
+  });
+}
+
 export async function extractFrames(
   videoBlob: Blob,
   sampleRate: number,
@@ -14,47 +40,92 @@ export async function extractFrames(
     const video = document.createElement('video');
     video.muted = true;
     video.playsInline = true;
+    video.preload = 'auto';
     video.src = url;
 
     const canvas = document.createElement('canvas');
-    const ctx = canvas.getContext('2d')!;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
     const frames: ExtractedFrame[] = [];
     const interval = 1 / sampleRate;
 
-    video.addEventListener('loadedmetadata', () => {
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      const duration = video.duration;
-      const times: number[] = [];
-      for (let t = 0; t < duration; t += interval) {
-        times.push(parseFloat(t.toFixed(4)));
+    let cleaned = false;
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      URL.revokeObjectURL(url);
+    };
+
+    const onError = (msg: string) => {
+      cleanup();
+      reject(new Error(msg));
+    };
+
+    video.addEventListener('error', () => onError('Video failed to load. Try recording again.'));
+
+    video.addEventListener('loadedmetadata', async () => {
+      canvas.width = video.videoWidth || 1280;
+      canvas.height = video.videoHeight || 720;
+
+      let duration: number;
+      try {
+        duration = await getRealDuration(video);
+      } catch {
+        return onError('Could not determine video duration.');
       }
 
+      if (!isFinite(duration) || duration <= 0) {
+        return onError('Video duration could not be read. Try recording again.');
+      }
+
+      const times: number[] = [];
+      // Stay slightly inside the end to avoid seek-past-end failures
+      const safeEnd = Math.max(0, duration - 0.05);
+      for (let t = 0; t <= safeEnd; t += interval) {
+        times.push(parseFloat(t.toFixed(4)));
+      }
+      if (times.length === 0) times.push(0);
+
       let idx = 0;
+      let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+
       const seekNext = () => {
         if (idx >= times.length) {
-          URL.revokeObjectURL(url);
+          if (timeoutHandle) clearTimeout(timeoutHandle);
+          cleanup();
           resolve(frames);
           return;
         }
-        video.currentTime = times[idx];
+        // Hard timeout: if a single seek doesn't fire 'seeked' within 4s,
+        // abandon the rest and return what we have
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+        timeoutHandle = setTimeout(() => {
+          cleanup();
+          resolve(frames);
+        }, 4000);
+        try {
+          video.currentTime = times[idx];
+        } catch {
+          // Some browsers throw if seeking before fully ready — push past it
+          idx++;
+          seekNext();
+        }
       };
 
-      video.addEventListener('seeked', () => {
-        ctx.drawImage(video, 0, 0);
-        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        frames.push({ imageData, time: video.currentTime, index: idx });
-        onProgress?.((idx / times.length) * 100);
+      const onSeeked = () => {
+        try {
+          ctx.drawImage(video, 0, 0);
+          const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          frames.push({ imageData, time: video.currentTime, index: idx });
+          onProgress?.((idx / times.length) * 100);
+        } catch {
+          // Skip frames that fail to draw (e.g., transient codec issues)
+        }
         idx++;
         seekNext();
-      });
+      };
 
+      video.addEventListener('seeked', onSeeked);
       seekNext();
-    });
-
-    video.addEventListener('error', () => {
-      URL.revokeObjectURL(url);
-      reject(new Error('Video load error'));
     });
 
     video.load();
