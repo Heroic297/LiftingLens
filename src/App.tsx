@@ -12,16 +12,16 @@ import { TodaySession } from './components/TodaySession';
 import { HistoryPanel } from './components/HistoryPanel';
 import { SettingsPanel } from './components/SettingsPanel';
 
-type QuickStep = 'record' | 'calibrate' | 'analyze' | 'results';
-type ProgramStep = 'import_or_select' | 'day_session' | 'record' | 'calibrate' | 'analyze' | 'results';
+type QuickStep = 'record' | 'analyze' | 'results';
+type ProgramStep = 'import_or_select' | 'day_session' | 'record' | 'analyze' | 'results';
 type Overlay = 'history' | 'settings' | null;
 
 export default function App() {
-  const { mode, loadHistory, loadPrograms, loadSettings, settings, recordedBlob, calibration, setCalibration, resetAnalysis, selectedProgram } = useAppStore();
+  const { mode, loadHistory, loadPrograms, loadSettings, settings, recordedBlob, setCalibration, resetAnalysis, selectedProgram } = useAppStore();
   const [quickStep, setQuickStep] = useState<QuickStep>('record');
   const [programStep, setProgramStep] = useState<ProgramStep>('import_or_select');
   const [overlay, setOverlay] = useState<Overlay>(null);
-  const [showCalib, setShowCalib] = useState(false);
+  const [showRecalibrate, setShowRecalibrate] = useState(false);
 
   useEffect(() => {
     loadHistory();
@@ -29,33 +29,17 @@ export default function App() {
     loadSettings();
   }, [loadHistory, loadPrograms, loadSettings]);
 
-  // Reset flow steps when mode changes
   useEffect(() => {
     setQuickStep('record');
     setProgramStep(selectedProgram ? 'day_session' : 'import_or_select');
     resetAnalysis();
-    setShowCalib(false);
+    setShowRecalibrate(false);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode]);
 
   const toggleOverlay = (o: Overlay) => setOverlay((prev) => (prev === o ? null : o));
 
   const handleRecordingComplete = () => {
-    setShowCalib(true);
-    if (mode === 'quick') setQuickStep('calibrate');
-    else setProgramStep('calibrate');
-  };
-
-  const handleCalibrated = (cal: Parameters<typeof setCalibration>[0]) => {
-    setCalibration(cal);
-    setShowCalib(false);
-    if (mode === 'quick') setQuickStep('analyze');
-    else setProgramStep('analyze');
-  };
-
-  const handleSkipCalib = () => {
-    setCalibration(null);
-    setShowCalib(false);
     if (mode === 'quick') setQuickStep('analyze');
     else setProgramStep('analyze');
   };
@@ -68,6 +52,14 @@ export default function App() {
   const handleSaved = () => {
     if (mode === 'quick') { setQuickStep('record'); resetAnalysis(); }
     else { setProgramStep('day_session'); resetAnalysis(); }
+  };
+
+  const handleRecalibrate = (cal: Parameters<typeof setCalibration>[0]) => {
+    setCalibration(cal);
+    setShowRecalibrate(false);
+    // Re-run analysis with new calibration
+    if (mode === 'quick') setQuickStep('analyze');
+    else setProgramStep('analyze');
   };
 
   return (
@@ -87,27 +79,25 @@ export default function App() {
 
         {mode === 'quick' && (
           <div className="flow-container">
-            <StepIndicator steps={['Record', 'Calibrate', 'Analyze', 'Results']} current={['record', 'calibrate', 'analyze', 'results'].indexOf(quickStep)} />
+            <StepIndicator steps={['Record', 'Analyze', 'Results']} current={['record', 'analyze', 'results'].indexOf(quickStep)} />
 
             {quickStep === 'record' && (
               <CameraRecorder onRecordingComplete={handleRecordingComplete} />
             )}
 
-            {quickStep === 'calibrate' && recordedBlob && (
+            {quickStep === 'analyze' && <VideoAnalyzer onComplete={handleAnalysisComplete} />}
+
+            {quickStep === 'results' && !showRecalibrate && (
+              <VelocityResults onSaved={handleSaved} onRecalibrate={() => setShowRecalibrate(true)} />
+            )}
+
+            {quickStep === 'results' && showRecalibrate && recordedBlob && (
               <CalibrationWizard
                 videoBlob={recordedBlob}
                 defaultPlateDiameter={settings.defaultPlateDiameter}
-                onCalibrated={handleCalibrated}
-                onSkip={handleSkipCalib}
+                onCalibrated={handleRecalibrate}
+                onSkip={() => setShowRecalibrate(false)}
               />
-            )}
-
-            {quickStep === 'analyze' && (
-              <VideoAnalyzer onComplete={handleAnalysisComplete} />
-            )}
-
-            {quickStep === 'results' && (
-              <VelocityResults onSaved={handleSaved} />
             )}
           </div>
         )}
@@ -115,9 +105,7 @@ export default function App() {
         {mode === 'program' && (
           <div className="flow-container">
             {programStep === 'import_or_select' && (
-              <ProgramImportOrSelect
-                onImported={() => setProgramStep('day_session')}
-              />
+              <ProgramImportOrSelect onImported={() => setProgramStep('day_session')} />
             )}
 
             {programStep === 'day_session' && (
@@ -131,21 +119,19 @@ export default function App() {
               <CameraRecorder onRecordingComplete={handleRecordingComplete} />
             )}
 
-            {programStep === 'calibrate' && recordedBlob && (
+            {programStep === 'analyze' && <VideoAnalyzer onComplete={handleAnalysisComplete} />}
+
+            {programStep === 'results' && !showRecalibrate && (
+              <VelocityResults onSaved={handleSaved} onRecalibrate={() => setShowRecalibrate(true)} />
+            )}
+
+            {programStep === 'results' && showRecalibrate && recordedBlob && (
               <CalibrationWizard
                 videoBlob={recordedBlob}
                 defaultPlateDiameter={settings.defaultPlateDiameter}
-                onCalibrated={handleCalibrated}
-                onSkip={handleSkipCalib}
+                onCalibrated={handleRecalibrate}
+                onSkip={() => setShowRecalibrate(false)}
               />
-            )}
-
-            {programStep === 'analyze' && (
-              <VideoAnalyzer onComplete={handleAnalysisComplete} />
-            )}
-
-            {programStep === 'results' && (
-              <VelocityResults onSaved={handleSaved} />
             )}
           </div>
         )}

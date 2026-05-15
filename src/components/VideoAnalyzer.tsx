@@ -1,23 +1,41 @@
 import { useRef, useState, useEffect, useCallback } from 'react';
-import { Crosshair, Play, AlertTriangle } from 'lucide-react';
+import { Crosshair, Play, AlertTriangle, Wand2, MousePointerClick } from 'lucide-react';
 import { useAppStore } from '../store/useAppStore';
 import { extractFrames } from '../lib/video/frameExtractor';
 import { trackMarker } from '../lib/video/markerTracker';
 import { computeSetResult } from '../lib/video/velocityCalc';
+import { detectMarkerAuto } from '../lib/video/autoDetect';
 
 interface VideoAnalyzerProps {
   onComplete: () => void;
 }
 
+type Stage = 'idle' | 'extracting' | 'detecting' | 'tracking' | 'computing' | 'manual';
+
 export function VideoAnalyzer({ onComplete }: VideoAnalyzerProps) {
-  const { recordedBlob, calibration, selectedLift, settings, setCurrentSetResult, setAnalyzing, setAnalysisProgress, isAnalyzing, analysisProgress } = useAppStore();
+  const {
+    recordedBlob,
+    calibration,
+    setCalibration,
+    selectedLift,
+    settings,
+    setCurrentSetResult,
+    setAnalyzing,
+    setAnalysisProgress,
+    isAnalyzing,
+    analysisProgress,
+  } = useAppStore();
+
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [markerSet, setMarkerSet] = useState(false);
-  const [markerPos, setMarkerPos] = useState<{ x: number; y: number } | null>(null);
-  const [frameLoaded, setFrameLoaded] = useState(false);
+  const [stage, setStage] = useState<Stage>('idle');
+  const [stageLabel, setStageLabel] = useState('');
   const [imgSize, setImgSize] = useState({ w: 1, h: 1 });
   const [error, setError] = useState<string | null>(null);
+  const [manualPos, setManualPos] = useState<{ x: number; y: number } | null>(null);
+  const [autoDetectedPos, setAutoDetectedPos] = useState<{ x: number; y: number; radius: number | null } | null>(null);
+  const hasRunRef = useRef(false);
 
+  // Load first frame for preview / manual fallback canvas
   useEffect(() => {
     if (!recordedBlob) return;
     const url = URL.createObjectURL(recordedBlob);
@@ -33,110 +51,259 @@ export function VideoAnalyzer({ onComplete }: VideoAnalyzerProps) {
       setImgSize({ w: video.videoWidth, h: video.videoHeight });
       const ctx = canvas.getContext('2d')!;
       ctx.drawImage(video, 0, 0);
-      setFrameLoaded(true);
       URL.revokeObjectURL(url);
     });
     video.load();
   }, [recordedBlob]);
 
-  const handleCanvasClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (markerSet || isAnalyzing) return;
+  const drawMarker = useCallback((x: number, y: number, radius: number | null, color: string) => {
+    const canvas = canvasRef.current;
+    if (!canvas || !recordedBlob) return;
+    const url = URL.createObjectURL(recordedBlob);
+    const video = document.createElement('video');
+    video.muted = true;
+    video.src = url;
+    video.currentTime = 0;
+    video.addEventListener('loadeddata', () => {
+      const ctx = canvas.getContext('2d')!;
+      ctx.drawImage(video, 0, 0);
+      if (radius) {
+        ctx.beginPath();
+        ctx.arc(x, y, radius, 0, Math.PI * 2);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 3;
+        ctx.setLineDash([8, 6]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+      ctx.beginPath();
+      ctx.arc(x, y, 12, 0, Math.PI * 2);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 3;
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(x, y, 4, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+      URL.revokeObjectURL(url);
+    });
+    video.load();
+  }, [recordedBlob]);
+
+  const runFullAnalysis = useCallback(async () => {
+    if (!recordedBlob) return;
+    setAnalyzing(true);
+    setError(null);
+    setAutoDetectedPos(null);
+    setManualPos(null);
+
+    try {
+      setStage('extracting');
+      setStageLabel('Extracting frames…');
+      const frames = await extractFrames(recordedBlob, settings.sampleRate, (pct) => setAnalysisProgress(pct * 0.5));
+      if (frames.length < 5) throw new Error('Video too short — record at least a couple of seconds.');
+
+      setStage('detecting');
+      setStageLabel('Auto-detecting bar…');
+      setAnalysisProgress(55);
+      // Allow paint
+      await new Promise((r) => setTimeout(r, 16));
+
+      const auto = detectMarkerAuto(frames);
+      if (!auto) throw new Error('Could not analyze frames — try re-recording.');
+
+      // If motion confidence is too low, fall back to manual marker selection
+      if (auto.motionConfidence < 0.35) {
+        setStage('manual');
+        setStageLabel('');
+        setAnalyzing(false);
+        setError('Auto-detection confidence was low. Tap on the bar in the frame below to set the marker manually.');
+        return;
+      }
+
+      setAutoDetectedPos({ x: auto.seedX, y: auto.seedY, radius: auto.plateRadiusPixels });
+      drawMarker(auto.seedX, auto.seedY, auto.plateRadiusPixels, '#4ee2ec');
+
+      // Auto-calibrate if a plate circle was detected with reasonable confidence
+      let activeCalibration = calibration;
+      if (!activeCalibration && auto.plateRadiusPixels && auto.plateConfidence > 0.35) {
+        const pixelDiameter = auto.plateRadiusPixels * 2;
+        const metersPerPixel = settings.defaultPlateDiameter / pixelDiameter;
+        activeCalibration = {
+          metersPerPixel,
+          method: 'plate_diameter',
+          knownDistanceMeters: settings.defaultPlateDiameter,
+          pixelDistance: pixelDiameter,
+        };
+        setCalibration(activeCalibration);
+      }
+
+      setStage('tracking');
+      setStageLabel('Tracking motion…');
+      setAnalysisProgress(70);
+      await new Promise((r) => setTimeout(r, 16));
+
+      const points = trackMarker(frames, auto.seedX, auto.seedY, settings.markerSearchRadius);
+
+      setStage('computing');
+      setStageLabel('Computing velocity…');
+      setAnalysisProgress(92);
+      await new Promise((r) => setTimeout(r, 16));
+
+      const warnings: string[] = [];
+      if (auto.motionConfidence < 0.6) {
+        warnings.push('Auto-detection confidence was moderate — verify the marker on the frame and re-analyze manually if needed.');
+      }
+      if (!activeCalibration) {
+        warnings.push('No calibration — velocity is in relative units. Tap "Recalibrate" on results for m/s.');
+      }
+
+      const result = computeSetResult(points, selectedLift, activeCalibration, warnings);
+      setCurrentSetResult(result);
+      setAnalysisProgress(100);
+      setStage('idle');
+      setTimeout(onComplete, 400);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Analysis failed. Try re-recording.');
+      setStage('idle');
+    } finally {
+      setAnalyzing(false);
+    }
+  }, [recordedBlob, settings, selectedLift, calibration, setCalibration, setAnalyzing, setAnalysisProgress, setCurrentSetResult, drawMarker, onComplete]);
+
+  // Kick off auto-analysis once on mount
+  useEffect(() => {
+    if (hasRunRef.current || !recordedBlob) return;
+    hasRunRef.current = true;
+    // Small delay so canvas can render first
+    const t = setTimeout(() => { runFullAnalysis(); }, 100);
+    return () => clearTimeout(t);
+  }, [recordedBlob, runFullAnalysis]);
+
+  // Manual fallback: user taps the canvas
+  const handleManualClick = useCallback(async (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (stage !== 'manual' || !recordedBlob) return;
     const canvas = canvasRef.current!;
     const rect = canvas.getBoundingClientRect();
     const scaleX = imgSize.w / rect.width;
     const scaleY = imgSize.h / rect.height;
     const x = (e.clientX - rect.left) * scaleX;
     const y = (e.clientY - rect.top) * scaleY;
-    setMarkerPos({ x, y });
+    setManualPos({ x, y });
+    drawMarker(x, y, null, '#f59e0b');
+  }, [stage, recordedBlob, imgSize, drawMarker]);
 
-    const ctx = canvas.getContext('2d')!;
-    ctx.beginPath();
-    ctx.arc(x, y, 10, 0, Math.PI * 2);
-    ctx.strokeStyle = '#f59e0b';
-    ctx.lineWidth = 3;
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.arc(x, y, 3, 0, Math.PI * 2);
-    ctx.fillStyle = '#f59e0b';
-    ctx.fill();
-
-    setMarkerSet(true);
-  }, [markerSet, isAnalyzing, imgSize]);
-
-  const runAnalysis = useCallback(async () => {
-    if (!recordedBlob || !markerPos) return;
+  const runManualTrack = useCallback(async () => {
+    if (!manualPos || !recordedBlob) return;
     setAnalyzing(true);
     setError(null);
-
     try {
-      const frames = await extractFrames(recordedBlob, settings.sampleRate, (pct) => setAnalysisProgress(pct * 0.7));
-      if (frames.length < 5) throw new Error('Video too short or frame extraction failed.');
+      setStage('extracting');
+      setStageLabel('Extracting frames…');
+      const frames = await extractFrames(recordedBlob, settings.sampleRate, (pct) => setAnalysisProgress(pct * 0.6));
 
+      setStage('tracking');
+      setStageLabel('Tracking motion…');
       setAnalysisProgress(70);
-      const points = trackMarker(frames, markerPos.x, markerPos.y, settings.markerSearchRadius);
-      setAnalysisProgress(90);
+      await new Promise((r) => setTimeout(r, 16));
+      const points = trackMarker(frames, manualPos.x, manualPos.y, settings.markerSearchRadius);
 
-      const result = computeSetResult(points, selectedLift, calibration);
+      setStage('computing');
+      setStageLabel('Computing velocity…');
+      setAnalysisProgress(92);
+      await new Promise((r) => setTimeout(r, 16));
+
+      const warnings: string[] = [];
+      if (!calibration) warnings.push('No calibration — velocity is in relative units.');
+
+      const result = computeSetResult(points, selectedLift, calibration, warnings);
       setCurrentSetResult(result);
       setAnalysisProgress(100);
+      setStage('idle');
       setTimeout(onComplete, 400);
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Analysis failed. Try re-recording.');
+      setError(e instanceof Error ? e.message : 'Analysis failed.');
+      setStage('idle');
     } finally {
       setAnalyzing(false);
     }
-  }, [recordedBlob, markerPos, settings, selectedLift, calibration, setAnalyzing, setAnalysisProgress, setCurrentSetResult, onComplete]);
+  }, [manualPos, recordedBlob, settings, selectedLift, calibration, setAnalyzing, setAnalysisProgress, setCurrentSetResult, onComplete]);
 
-  if (!recordedBlob) return null;
+  const retryAuto = useCallback(() => {
+    hasRunRef.current = false;
+    setError(null);
+    setStage('idle');
+    setManualPos(null);
+    setAutoDetectedPos(null);
+    runFullAnalysis();
+  }, [runFullAnalysis]);
+
+  const running = isAnalyzing || (stage !== 'idle' && stage !== 'manual');
 
   return (
     <div className="analyzer-panel">
-      <div className="section-title"><Crosshair size={18} /> Select Tracking Marker</div>
+      <div className="section-title">
+        <Wand2 size={14} /> Auto Analysis
+      </div>
 
       {calibration ? (
         <div className="info-badge">Calibrated — results in m/s</div>
       ) : (
-        <div className="warn-badge"><AlertTriangle size={14} /> No calibration — relative velocity only</div>
+        <div className="warn-badge">
+          <AlertTriangle size={14} /> Relative velocity (no calibration yet)
+        </div>
       )}
 
-      <p className="hint">Tap the bar sleeve, collar, or visible plate edge to set the tracking point.</p>
+      {autoDetectedPos && !running && !error && (
+        <div className="info-badge">
+          <Crosshair size={14} /> Bar auto-detected at ({Math.round(autoDetectedPos.x)}, {Math.round(autoDetectedPos.y)})
+          {autoDetectedPos.radius && ` · plate ~${autoDetectedPos.radius}px`}
+        </div>
+      )}
 
       <canvas
         ref={canvasRef}
         className="analyzer-canvas"
-        onClick={handleCanvasClick}
-        style={{ cursor: markerSet ? 'default' : 'crosshair' }}
+        onClick={handleManualClick}
+        style={{ cursor: stage === 'manual' && !manualPos ? 'crosshair' : 'default' }}
       />
 
-      {frameLoaded && !markerSet && (
-        <p className="hint small">👆 Tap on the video frame above to place the tracking marker.</p>
-      )}
-
-      {isAnalyzing && (
+      {running && (
         <div className="progress-bar-wrap">
           <div className="progress-bar" style={{ width: `${analysisProgress}%` }} />
-          <span className="progress-label">{analysisProgress < 70 ? 'Extracting frames…' : analysisProgress < 90 ? 'Tracking marker…' : 'Computing velocity…'}</span>
+          <span className="progress-label">{stageLabel || 'Working…'} {Math.round(analysisProgress)}%</span>
         </div>
       )}
 
-      {error && <div className="error-box"><AlertTriangle size={16} /> {error}</div>}
+      {error && (
+        <div className="error-box">
+          <AlertTriangle size={16} /> {error}
+        </div>
+      )}
 
-      <div className="analyzer-actions">
-        <button
-          className="btn-secondary"
-          onClick={() => { setMarkerSet(false); setMarkerPos(null); }}
-          disabled={!markerSet || isAnalyzing}
-        >
-          Reset Marker
-        </button>
-        <button
-          className="btn-primary large"
-          onClick={runAnalysis}
-          disabled={!markerSet || isAnalyzing}
-        >
-          <Play size={18} /> {isAnalyzing ? `Analyzing… ${Math.round(analysisProgress)}%` : 'Run Analysis'}
-        </button>
-      </div>
+      {stage === 'manual' && (
+        <>
+          <p className="hint small">
+            <MousePointerClick size={12} style={{ display: 'inline', verticalAlign: 'middle' }} /> Tap the bar sleeve, collar, or plate edge in the frame above.
+          </p>
+          <div className="analyzer-actions">
+            <button className="btn-secondary" onClick={retryAuto}>
+              <Wand2 size={14} /> Retry Auto
+            </button>
+            <button className="btn-primary large" onClick={runManualTrack} disabled={!manualPos}>
+              <Play size={16} /> Analyze Manual
+            </button>
+          </div>
+        </>
+      )}
+
+      {!running && stage !== 'manual' && error && (
+        <div className="analyzer-actions">
+          <button className="btn-primary" onClick={retryAuto}>
+            <Wand2 size={16} /> Retry
+          </button>
+        </div>
+      )}
     </div>
   );
 }

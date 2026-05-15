@@ -1,4 +1,4 @@
-import { Save, AlertTriangle, TrendingUp, TrendingDown, Minus } from 'lucide-react';
+import { Save, AlertTriangle, TrendingUp, TrendingDown, Minus, Ruler } from 'lucide-react';
 import { useAppStore } from '../store/useAppStore';
 import { formatVelocity, formatDate, liftLabel } from '../lib/utils';
 import { VelocityChart } from './VelocityChart';
@@ -7,9 +7,10 @@ import { useState } from 'react';
 
 interface VelocityResultsProps {
   onSaved?: () => void;
+  onRecalibrate?: () => void;
 }
 
-export function VelocityResults({ onSaved }: VelocityResultsProps) {
+export function VelocityResults({ onSaved, onRecalibrate }: VelocityResultsProps) {
   const { currentSetResult, saveCurrentSet, settings, selectedExerciseId, selectedProgram, selectedWeekIdx, selectedDayIdx } = useAppStore();
   const [saved, setSaved] = useState(false);
   const [userRPE, setUserRPE] = useState<number | ''>('');
@@ -126,9 +127,16 @@ export function VelocityResults({ onSaved }: VelocityResultsProps) {
         </details>
       </div>
 
-      <button className="btn-primary full-width" onClick={handleSave} disabled={saved}>
-        <Save size={16} /> {saved ? 'Saved!' : 'Save Set'}
-      </button>
+      <div className="results-actions">
+        {onRecalibrate && (
+          <button className="btn-secondary" onClick={onRecalibrate}>
+            <Ruler size={14} /> {r.isCalibrated ? 'Recalibrate' : 'Calibrate for m/s'}
+          </button>
+        )}
+        <button className="btn-primary full-width" onClick={handleSave} disabled={saved}>
+          <Save size={16} /> {saved ? 'Saved!' : 'Save Set'}
+        </button>
+      </div>
     </div>
   );
 }
