@@ -90,10 +90,15 @@ export function segmentReps(
   const smoothWindow = Math.max(3, Math.min(11, rawWindow % 2 === 0 ? rawWindow + 1 : rawWindow));
   const smoothed = smooth(positions, smoothWindow);
 
-  // Minimum rep duration in frames: at least 8 frames (prevents noise spikes
-  // from being counted as reps, especially at RPE 8-9 where bar slows near
-  // sticking point and acceleration noise can split a single rep).
-  const minRepFrames = Math.max(8, Math.round(fps * 0.30));
+  // Minimum rep duration in frames: a lightweight frame-count guard against
+  // spurious sub-frame noise spikes. The primary noise filter is the 0.3 s
+  // duration check further below — that rejects anything shorter than 4-5
+  // frames at 15 fps regardless. Here we only block < 4 frames (< ~0.27 s)
+  // to avoid splitting a single rep at the sticking-point dip in RPE 8-9.
+  // Previous value (8 frames) was too strict: an RPE-6 bench concentric
+  // lasts only ~3-5 frames at 15 fps (0.2–0.35 s), so 8 frames wrongly
+  // rejected all fast reps.
+  const minRepFrames = Math.max(4, Math.round(fps * 0.15));
 
   const minVal = Math.min(...smoothed);
   const maxVal = Math.max(...smoothed);
@@ -122,10 +127,32 @@ export function segmentReps(
   // For deadlift with no peaks found (e.g. bar rises monotonically from start
   // to end with no clear global maximum due to noise), synthesize the peak at
   // the position of maximum value.
-  let effectivePeaks = peaks;
-  if (isDeadlift && peaks.length === 0 && smoothed[smoothed.length - 1] > smoothed[0]) {
+  let effectivePeaks = [...peaks];
+  if (isDeadlift && effectivePeaks.length === 0 && smoothed[smoothed.length - 1] > smoothed[0]) {
     const maxIdx = smoothed.indexOf(Math.max(...smoothed));
     effectivePeaks = [{ index: maxIdx, value: smoothed[maxIdx] }];
+  }
+
+  // For bench/squat: recordings often start at lockout (bar at top = high
+  // projection) then descend eccentrically before the concentric rep. In that
+  // case the concentric peak is at the END of the clip and is never detected
+  // by findPeaks (which requires arr[i] > arr[i+1], impossible at the last
+  // sample). Add the end-of-clip as a synthetic peak if:
+  //   - it's the highest value in the last 20% of the signal
+  //   - it lies above the overall mean by at least minProminence/2
+  //   - no real peak was already found near the end
+  if (!isDeadlift) {
+    const endRegionStart = Math.floor(smoothed.length * 0.80);
+    const lastVal = smoothed[smoothed.length - 1];
+    const meanVal = smoothed.reduce((a, b) => a + b, 0) / smoothed.length;
+    const endIsHigh = lastVal > meanVal + minProminence * 0.5;
+    const alreadyHasPeakNearEnd = effectivePeaks.some((p) => p.index >= endRegionStart);
+    if (endIsHigh && !alreadyHasPeakNearEnd) {
+      effectivePeaks = [
+        ...effectivePeaks,
+        { index: smoothed.length - 1, value: lastVal },
+      ].sort((a, b) => a.index - b.index);
+    }
   }
 
   const reps: RepResult[] = [];

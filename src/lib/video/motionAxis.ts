@@ -80,15 +80,36 @@ export function computeMotionAxis(points: Array<{ x: number; y: number }>): Moti
   ax /= len;
   ay /= len;
 
-  // Make sure axisY <= 0 so positive projection = upward in image coords.
-  // (Image Y increases downward; "up in the gym" = decreasing Y.)
-  if (ay > 0) {
-    ax = -ax;
-    ay = -ay;
+  // Enforce sign convention so that positive projection = "up in the gym".
+  //
+  // Two cases depending on the dominant motion axis:
+  //
+  // 1. Primarily VERTICAL motion (|ay| >= |ax|) — standard landscape or overhead camera.
+  //    Image Y increases downward, so "up" = decreasing Y = negative ay.
+  //    Constraint: ay <= 0.
+  //
+  // 2. Primarily HORIZONTAL motion (|ax| > |ay|) — portrait-mode video where the phone
+  //    was rotated -90°.  The browser applies the rotation so the canvas is portrait
+  //    (frameH > frameW), but raw pixel X still maps to the vertical gym axis.
+  //    Specifically: increasing X = bar moving downward (toward the floor).
+  //    So "up in the gym" = decreasing X = negative ax.
+  //    Constraint: ax <= 0.
+  if (Math.abs(ax) > Math.abs(ay)) {
+    // Portrait / horizontal-dominant motion
+    if (ax > 0) {
+      ax = -ax;
+      ay = -ay;
+    }
+  } else {
+    // Landscape / vertical-dominant motion
+    if (ay > 0) {
+      ax = -ax;
+      ay = -ay;
+    }
   }
 
   // Angle from vertical (0,-1)
-  const dot = -ay; // axisY=-1 dot with (ax,ay) = -ay
+  const dot = -ay; // dot of axis with (0,-1)
   const angleFromVertical = (Math.acos(Math.min(1, Math.max(-1, dot))) * 180) / Math.PI;
 
   return {
