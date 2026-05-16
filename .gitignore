@@ -27,3 +27,6 @@ Thumbs.db
 
 # Local-only Claude config
 .claude/launch.json
+
+# Local test videos (keep out of repo / deploy bundle)
+public/test-videos/

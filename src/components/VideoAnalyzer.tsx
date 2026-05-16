@@ -1,10 +1,12 @@
 import { useRef, useState, useEffect, useCallback } from 'react';
-import { Crosshair, Play, AlertTriangle, Wand2, MousePointerClick } from 'lucide-react';
+import { Crosshair, Play, AlertTriangle, Wand2, MousePointerClick, Dumbbell } from 'lucide-react';
 import { useAppStore } from '../store/useAppStore';
 import { extractFrames } from '../lib/video/frameExtractor';
 import { trackMarker } from '../lib/video/markerTracker';
 import { computeSetResult } from '../lib/video/velocityCalc';
 import { detectMarkerAuto } from '../lib/video/autoDetect';
+import type { LiftType, TrackedPoint } from '../types/training';
+import { liftLabel } from '../lib/utils';
 
 interface VideoAnalyzerProps {
   onComplete: () => void;
@@ -12,12 +14,51 @@ interface VideoAnalyzerProps {
 
 type Stage = 'idle' | 'extracting' | 'detecting' | 'tracking' | 'computing' | 'manual';
 
+/**
+ * Infer lift type from the 2D tracked trajectory.
+ * Uses bar mean position in frame + dwell time at the bottom of the range.
+ */
+function classifyLiftType(points: TrackedPoint[], frameHeight: number): LiftType {
+  if (points.length < 5) return 'squat';
+
+  const yValues = points.map((p) => p.y);
+  const meanY = yValues.reduce((a, b) => a + b, 0) / yValues.length;
+  const minY = Math.min(...yValues);
+  const maxY = Math.max(...yValues);
+  const rangeY = maxY - minY;
+
+  const relMeanY = meanY / frameHeight; // 0 = top, 1 = bottom of image
+  const relRangeY = rangeY / frameHeight;
+
+  // Dwell: fraction of frames where bar is in bottom 15% of its own range
+  const dwellThresh = maxY - rangeY * 0.15;
+  const dwellFrac = yValues.filter((y) => y >= dwellThresh).length / yValues.length;
+
+  // Deadlift: bar sits in the lower part of frame, or clear dwell at the floor position
+  if (relMeanY > 0.58 || (relMeanY > 0.44 && dwellFrac > 0.25 && relRangeY > 0.12)) {
+    return 'deadlift';
+  }
+
+  // Overhead press: bar consistently high in frame with meaningful ROM
+  if (relMeanY < 0.28 && relRangeY > 0.10) {
+    return 'overhead_press';
+  }
+
+  // Bench: small ROM relative to frame height, bar at mid-frame
+  if (relRangeY < 0.14 && relMeanY > 0.35 && relMeanY < 0.65) {
+    return 'bench';
+  }
+
+  return 'squat';
+}
+
 export function VideoAnalyzer({ onComplete }: VideoAnalyzerProps) {
   const {
     recordedBlob,
     calibration,
     setCalibration,
     selectedLift,
+    setLift,
     settings,
     setCurrentSetResult,
     setAnalyzing,
@@ -33,9 +74,9 @@ export function VideoAnalyzer({ onComplete }: VideoAnalyzerProps) {
   const [error, setError] = useState<string | null>(null);
   const [manualPos, setManualPos] = useState<{ x: number; y: number } | null>(null);
   const [autoDetectedPos, setAutoDetectedPos] = useState<{ x: number; y: number; radius: number | null } | null>(null);
+  const [detectedLift, setDetectedLift] = useState<LiftType | null>(null);
   const hasRunRef = useRef(false);
 
-  // Load first frame for preview / manual fallback canvas
   useEffect(() => {
     if (!recordedBlob) return;
     const url = URL.createObjectURL(recordedBlob);
@@ -96,6 +137,7 @@ export function VideoAnalyzer({ onComplete }: VideoAnalyzerProps) {
     setError(null);
     setAutoDetectedPos(null);
     setManualPos(null);
+    setDetectedLift(null);
 
     try {
       setStage('extracting');
@@ -111,13 +153,11 @@ export function VideoAnalyzer({ onComplete }: VideoAnalyzerProps) {
       setStage('detecting');
       setStageLabel('Auto-detecting bar…');
       setAnalysisProgress(55);
-      // Allow paint
       await new Promise((r) => setTimeout(r, 16));
 
       const auto = detectMarkerAuto(frames);
       if (!auto) throw new Error('Could not analyze frames — try re-recording.');
 
-      // If motion confidence is too low, fall back to manual marker selection
       if (auto.motionConfidence < 0.35) {
         setStage('manual');
         setStageLabel('');
@@ -129,7 +169,6 @@ export function VideoAnalyzer({ onComplete }: VideoAnalyzerProps) {
       setAutoDetectedPos({ x: auto.seedX, y: auto.seedY, radius: auto.plateRadiusPixels });
       drawMarker(auto.seedX, auto.seedY, auto.plateRadiusPixels, '#4ee2ec');
 
-      // Auto-calibrate if a plate circle was detected with reasonable confidence
       let activeCalibration = calibration;
       if (!activeCalibration && auto.plateRadiusPixels && auto.plateConfidence > 0.35) {
         const pixelDiameter = auto.plateRadiusPixels * 2;
@@ -148,7 +187,30 @@ export function VideoAnalyzer({ onComplete }: VideoAnalyzerProps) {
       setAnalysisProgress(70);
       await new Promise((r) => setTimeout(r, 16));
 
-      const points = trackMarker(frames, auto.seedX, auto.seedY, settings.markerSearchRadius);
+      // Bidirectional tracking from the frame where bar motion peaks at the
+      // detected seed. This ensures the template is always of the bar itself,
+      // not background — critical when bar starts at a different height (deadlift).
+      let points: TrackedPoint[];
+      const seedIdx = auto.seedFrameIdx;
+      if (seedIdx <= 1) {
+        points = trackMarker(frames, auto.seedX, auto.seedY, settings.markerSearchRadius);
+      } else {
+        const forwardFrames = frames.slice(seedIdx);
+        const backwardFrames = frames.slice(0, seedIdx + 1).reverse();
+
+        const fwd = trackMarker(forwardFrames, auto.seedX, auto.seedY, settings.markerSearchRadius);
+        const bwd = trackMarker(backwardFrames, auto.seedX, auto.seedY, settings.markerSearchRadius);
+        bwd.reverse();
+
+        // bwd covers [0..seedIdx], fwd covers [seedIdx..end]. Drop the duplicate seedFrame.
+        points = [...bwd.slice(0, -1), ...fwd];
+      }
+
+      // Infer lift type from the trajectory, auto-select in the store
+      const frameH = frames[0].imageData.height;
+      const inferredLift = classifyLiftType(points, frameH);
+      setDetectedLift(inferredLift);
+      setLift(inferredLift);
 
       setStage('computing');
       setStageLabel('Computing velocity…');
@@ -160,10 +222,10 @@ export function VideoAnalyzer({ onComplete }: VideoAnalyzerProps) {
         warnings.push('Auto-detection confidence was moderate — verify the marker on the frame and re-analyze manually if needed.');
       }
       if (!activeCalibration) {
-        warnings.push('No calibration — velocity is in relative units. Tap "Recalibrate" on results for m/s.');
+        warnings.push('No calibration — velocity is in relative units. Tap "Calibrate" on results for m/s.');
       }
 
-      const result = computeSetResult(points, selectedLift, activeCalibration, warnings);
+      const result = computeSetResult(points, inferredLift, activeCalibration, warnings);
       setCurrentSetResult(result);
       setAnalysisProgress(100);
       setStage('idle');
@@ -174,18 +236,15 @@ export function VideoAnalyzer({ onComplete }: VideoAnalyzerProps) {
     } finally {
       setAnalyzing(false);
     }
-  }, [recordedBlob, settings, selectedLift, calibration, setCalibration, setAnalyzing, setAnalysisProgress, setCurrentSetResult, drawMarker, onComplete]);
+  }, [recordedBlob, settings, calibration, setCalibration, setLift, setAnalyzing, setAnalysisProgress, setCurrentSetResult, drawMarker, onComplete]);
 
-  // Kick off auto-analysis once on mount
   useEffect(() => {
     if (hasRunRef.current || !recordedBlob) return;
     hasRunRef.current = true;
-    // Small delay so canvas can render first
     const t = setTimeout(() => { runFullAnalysis(); }, 100);
     return () => clearTimeout(t);
   }, [recordedBlob, runFullAnalysis]);
 
-  // Manual fallback: user taps the canvas
   const handleManualClick = useCallback(async (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (stage !== 'manual' || !recordedBlob) return;
     const canvas = canvasRef.current!;
@@ -240,6 +299,7 @@ export function VideoAnalyzer({ onComplete }: VideoAnalyzerProps) {
     setStage('idle');
     setManualPos(null);
     setAutoDetectedPos(null);
+    setDetectedLift(null);
     runFullAnalysis();
   }, [runFullAnalysis]);
 
@@ -259,9 +319,15 @@ export function VideoAnalyzer({ onComplete }: VideoAnalyzerProps) {
         </div>
       )}
 
+      {detectedLift && !running && !error && (
+        <div className="info-badge">
+          <Dumbbell size={14} /> Detected: {liftLabel(detectedLift)}
+        </div>
+      )}
+
       {autoDetectedPos && !running && !error && (
         <div className="info-badge">
-          <Crosshair size={14} /> Bar auto-detected at ({Math.round(autoDetectedPos.x)}, {Math.round(autoDetectedPos.y)})
+          <Crosshair size={14} /> Bar detected at ({Math.round(autoDetectedPos.x)}, {Math.round(autoDetectedPos.y)})
           {autoDetectedPos.radius && ` · plate ~${autoDetectedPos.radius}px`}
         </div>
       )}

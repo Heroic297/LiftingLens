@@ -1,22 +1,19 @@
 import { useRef, useState, useEffect, useCallback } from 'react';
-import { Video, Square, RotateCcw, Check } from 'lucide-react';
+import { Video, Square, RotateCcw, Check, Upload } from 'lucide-react';
 import { useAppStore } from '../store/useAppStore';
-import type { LiftType } from '../types/training';
-import { liftLabel } from '../lib/utils';
-
-const LIFT_OPTIONS: LiftType[] = ['squat', 'bench', 'deadlift', 'overhead_press', 'row', 'other'];
 
 interface CameraRecorderProps {
   onRecordingComplete: () => void;
 }
 
 export function CameraRecorder({ onRecordingComplete }: CameraRecorderProps) {
-  const { selectedLift, setLift, setRecordedBlob, recordedBlob } = useAppStore();
+  const { setRecordedBlob, recordedBlob } = useAppStore();
   const videoRef = useRef<HTMLVideoElement>(null);
   const previewRef = useRef<HTMLVideoElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const streamRef = useRef<MediaStream | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [recording, setRecording] = useState(false);
   const [elapsed, setElapsed] = useState(0);
@@ -86,22 +83,21 @@ export function CameraRecorder({ onRecordingComplete }: CameraRecorderProps) {
     setElapsed(0);
   }, [setRecordedBlob]);
 
+  const handleImportVideo = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setRecordedBlob(file);
+    if (previewRef.current) {
+      previewRef.current.src = URL.createObjectURL(file);
+    }
+    // Reset input so the same file can be re-selected if needed
+    e.target.value = '';
+  }, [setRecordedBlob]);
+
   const formatTime = (s: number) => `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
 
   return (
     <div className="recorder-panel">
-      <div className="lift-selector">
-        {LIFT_OPTIONS.map((l) => (
-          <button
-            key={l}
-            className={`lift-chip ${selectedLift === l ? 'active' : ''}`}
-            onClick={() => setLift(l)}
-          >
-            {liftLabel(l)}
-          </button>
-        ))}
-      </div>
-
       {error && <div className="error-box">{error}</div>}
 
       {!recordedBlob ? (
@@ -110,8 +106,18 @@ export function CameraRecorder({ onRecordingComplete }: CameraRecorderProps) {
           {!cameraActive && !recording && (
             <div className="camera-overlay">
               <button className="btn-primary large" onClick={startCamera}>
-                <Video size={20} /> Enable Camera
+                <Video size={20} /> Record Video
               </button>
+              <label className="btn-secondary" style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6 }}>
+                <Upload size={16} /> Import Video
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="video/*"
+                  style={{ display: 'none' }}
+                  onChange={handleImportVideo}
+                />
+              </label>
             </div>
           )}
           {cameraActive && !recording && (
@@ -137,6 +143,15 @@ export function CameraRecorder({ onRecordingComplete }: CameraRecorderProps) {
             <button className="btn-secondary" onClick={reset}>
               <RotateCcw size={16} /> Re-record
             </button>
+            <label className="btn-secondary" style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6 }}>
+              <Upload size={14} /> Different Video
+              <input
+                type="file"
+                accept="video/*"
+                style={{ display: 'none' }}
+                onChange={handleImportVideo}
+              />
+            </label>
             <button className="btn-primary" onClick={onRecordingComplete}>
               <Check size={16} /> Analyze This Set
             </button>

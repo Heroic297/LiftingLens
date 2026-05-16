@@ -1,90 +1,145 @@
 import type { LiftType, RepResult } from '../../types/training';
-import { movingAverage } from '../utils';
 
 export interface SegmentationResult {
   reps: RepResult[];
-  smoothedY: number[];
+  smoothedPositions: number[];
   warnings: string[];
 }
 
-function detectPeaksAndValleys(arr: number[]): { peaks: number[]; valleys: number[] } {
-  const peaks: number[] = [];
-  const valleys: number[] = [];
-  for (let i = 1; i < arr.length - 1; i++) {
-    if (arr[i] > arr[i - 1] && arr[i] > arr[i + 1]) peaks.push(i);
-    if (arr[i] < arr[i - 1] && arr[i] < arr[i + 1]) valleys.push(i);
-  }
-  return { peaks, valleys };
+/** Symmetric moving-average with edge clamping. */
+function smooth(arr: number[], window: number): number[] {
+  const half = Math.floor(window / 2);
+  return arr.map((_, i) => {
+    const start = Math.max(0, i - half);
+    const end = Math.min(arr.length - 1, i + half);
+    let sum = 0;
+    for (let j = start; j <= end; j++) sum += arr[j];
+    return sum / (end - start + 1);
+  });
 }
 
+interface Extreme { index: number; value: number; }
+
+/**
+ * Find local maxima with minimum prominence. Prominence = how much a peak
+ * rises above the highest "saddle" connecting it to a taller neighbor.
+ * This filters noise while preserving real rep peaks even in noisy signals.
+ */
+function findPeaks(arr: number[], minProminence: number): Extreme[] {
+  const peaks: Extreme[] = [];
+  for (let i = 1; i < arr.length - 1; i++) {
+    if (arr[i] <= arr[i - 1] || arr[i] <= arr[i + 1]) continue;
+    let leftBase = arr[i];
+    for (let j = i - 1; j >= 0; j--) {
+      if (arr[j] >= arr[i]) break;
+      if (arr[j] < leftBase) leftBase = arr[j];
+    }
+    let rightBase = arr[i];
+    for (let j = i + 1; j < arr.length; j++) {
+      if (arr[j] >= arr[i]) break;
+      if (arr[j] < rightBase) rightBase = arr[j];
+    }
+    const prominence = arr[i] - Math.max(leftBase, rightBase);
+    if (prominence >= minProminence) peaks.push({ index: i, value: arr[i] });
+  }
+  return peaks;
+}
+
+function findValleys(arr: number[], minProminence: number): Extreme[] {
+  const neg = arr.map((v) => -v);
+  return findPeaks(neg, minProminence).map((p) => ({ index: p.index, value: arr[p.index] }));
+}
+
+/**
+ * Segment reps from 1D positions projected onto the principal motion axis
+ * (positive = "up in the gym"). Each rep is the concentric segment:
+ * valley (bottom of lift) → peak (top of lift).
+ *
+ * Uses prominence-based peak detection so real reps are found even when
+ * the signal has noise, wobbles, or camera shake — the threshold adapts
+ * to the actual range of motion in the clip.
+ */
 export function segmentReps(
-  yPositions: number[],
+  positions: number[],
   times: number[],
   liftType: LiftType,
   metersPerPixel: number | null,
-  minRomPixels = 20,
 ): SegmentationResult {
   const warnings: string[] = [];
 
-  if (yPositions.length < 5) {
+  if (positions.length < 10) {
     warnings.push('Too few tracking points to segment reps.');
-    return { reps: [], smoothedY: yPositions, warnings };
+    return { reps: [], smoothedPositions: positions, warnings };
   }
 
-  const smoothed = movingAverage(yPositions, 7);
+  // Adaptive smoothing: ~0.25 s regardless of frame rate
+  const totalTime = times[times.length - 1] - times[0];
+  const fps = positions.length / Math.max(totalTime, 0.001);
+  const rawWindow = Math.round(fps * 0.25);
+  const smoothWindow = Math.max(3, Math.min(11, rawWindow % 2 === 0 ? rawWindow + 1 : rawWindow));
+  const smoothed = smooth(positions, smoothWindow);
 
-  // In image coords, Y increases downward
-  // Concentric direction:
-  //   squat/bench: bar moves UP = y decreases
-  //   deadlift: bar moves UP = y decreases
-  //   overhead_press: bar moves UP = y decreases
-  //   row: bar moves UP = y decreases (pulling toward body)
-  // So concentric = decreasing Y for most lifts
+  const minVal = Math.min(...smoothed);
+  const maxVal = Math.max(...smoothed);
+  const totalRange = maxVal - minVal;
 
-  const { peaks, valleys } = detectPeaksAndValleys(smoothed);
+  if (totalRange < 5) {
+    warnings.push('Very little bar movement detected. Check marker placement and ensure the full lift is in frame.');
+    return { reps: [], smoothedPositions: smoothed, warnings };
+  }
 
-  // Pair valleys → peaks (concentric: from bottom to top = valley to peak in raw y)
-  // Actually since Y increases downward: bottom of lift = high Y (valley in inverted), top = low Y
-  // peaks in smoothed Y = bottom of lift
-  // valleys in smoothed Y = top of lift
-  // concentric = from peak to valley (moving up)
+  // Prominence threshold: 30% of observed range.
+  // Real reps easily exceed this; breathing wobbles and drift do not.
+  const minProminence = totalRange * 0.30;
+
+  const peaks = findPeaks(smoothed, minProminence).sort((a, b) => a.index - b.index);
+  const valleys = findValleys(smoothed, minProminence).sort((a, b) => a.index - b.index);
 
   const reps: RepResult[] = [];
-
-  if (peaks.length === 0 || valleys.length === 0) {
-    warnings.push('Could not detect rep peaks/valleys. Check marker tracking or lift direction.');
-    return { reps, smoothedY: smoothed, warnings };
-  }
-
-  // Build concentric segments: peak → next valley
-  const sortedPeaks = [...peaks].sort((a, b) => a - b);
-  const sortedValleys = [...valleys].sort((a, b) => a - b);
-
+  const usedValleyIndices = new Set<number>();
   let repNum = 1;
-  for (const peak of sortedPeaks) {
-    const nextValley = sortedValleys.find((v) => v > peak);
-    if (!nextValley) continue;
 
-    const romPixels = smoothed[peak] - smoothed[nextValley];
-    if (Math.abs(romPixels) < minRomPixels) continue;
+  for (const peak of peaks) {
+    // Find the most recent unused valley before this peak
+    let prevValley: Extreme | null = null;
+    for (let vi = valleys.length - 1; vi >= 0; vi--) {
+      if (valleys[vi].index < peak.index && !usedValleyIndices.has(valleys[vi].index)) {
+        prevValley = valleys[vi];
+        break;
+      }
+    }
 
-    const startTime = times[peak];
-    const endTime = times[nextValley];
+    // If no explicit valley precedes the first peak, use the signal start as an
+    // implicit bottom — handles recordings that begin mid-concentric.
+    if (!prevValley && peak.index > 0 && smoothed[0] < peak.value - minProminence * 0.5) {
+      prevValley = { index: 0, value: smoothed[0] };
+    }
+
+    if (!prevValley) continue;
+
+    const romProj = peak.value - prevValley.value;
+    if (romProj < totalRange * 0.20) continue; // ignore micro-movements
+
+    usedValleyIndices.add(prevValley.index);
+
+    const startIdx = prevValley.index;
+    const endIdx = peak.index;
+    const posSlice = smoothed.slice(startIdx, endIdx + 1);
+    const tSlice = times.slice(startIdx, endIdx + 1);
+
+    const startTime = tSlice[0];
+    const endTime = tSlice[tSlice.length - 1];
     const duration = endTime - startTime;
-    if (duration <= 0) continue;
+    if (duration < 0.1) continue; // skip sub-100ms spurious events
 
-    const ySlice = smoothed.slice(peak, nextValley + 1);
-    const tSlice = times.slice(peak, nextValley + 1);
-
-    // Compute velocity at each frame pair
+    // Velocity: only count frames where the bar is moving upward (concentric)
     const velocities: number[] = [];
-    for (let i = 1; i < ySlice.length; i++) {
-      const dy = ySlice[i - 1] - ySlice[i]; // upward movement = positive
+    for (let i = 1; i < posSlice.length; i++) {
+      const dpos = posSlice[i] - posSlice[i - 1]; // positive = moving up
       const dt = tSlice[i] - tSlice[i - 1];
-      if (dt > 0) {
-        const pixelVel = dy / dt;
-        const vel = metersPerPixel ? pixelVel * metersPerPixel : pixelVel;
-        if (vel > 0) velocities.push(vel);
+      if (dt > 0 && dpos > 0) {
+        const pv = dpos / dt;
+        velocities.push(metersPerPixel ? pv * metersPerPixel : pv);
       }
     }
 
@@ -92,7 +147,7 @@ export function segmentReps(
 
     const meanVel = velocities.reduce((a, b) => a + b, 0) / velocities.length;
     const peakVel = Math.max(...velocities);
-    const romMeters = metersPerPixel ? Math.abs(romPixels) * metersPerPixel : null;
+    const romMeters = metersPerPixel ? romProj * metersPerPixel : null;
 
     reps.push({
       repNumber: repNum++,
@@ -106,8 +161,11 @@ export function segmentReps(
   }
 
   if (reps.length === 0) {
-    warnings.push('No complete reps detected. Try adjusting marker position or recording more of the lift.');
+    warnings.push('No complete reps detected. Try adjusting marker position or recording the full lift from start to finish.');
   }
 
-  return { reps, smoothedY: smoothed, warnings };
+  // Suppress lift-type parameter warning — kept for future lift-specific tuning
+  void liftType;
+
+  return { reps, smoothedPositions: smoothed, warnings };
 }

@@ -3,6 +3,8 @@ import type { ExtractedFrame } from './frameExtractor';
 export interface AutoDetectResult {
   seedX: number;
   seedY: number;
+  /** Index into the frames array where the bar is most likely at (seedX, seedY). */
+  seedFrameIdx: number;
   plateRadiusPixels: number | null;
   motionConfidence: number;
   plateConfidence: number;
@@ -13,12 +15,10 @@ export interface AutoDetectResult {
  * Auto-detects the bar/plate location by finding the area of the frame
  * with the highest cumulative motion across the video.
  *
- * Idea: the camera is stationary; whatever is moving is (mostly) the bar.
- * We aggregate frame-to-frame luminance differences and find the spatial
- * region with the highest sustained motion. This seeds the patch tracker.
- *
- * Returns null only on absurdly short/empty input — even low-confidence
- * results are returned so the UI can flag them.
+ * Also finds the frame where the bar is most actively passing through the
+ * detected seed position — used as the template seed for bidirectional
+ * tracking, so the tracker starts with the right patch regardless of where
+ * the bar is in frame 0 (critical for deadlifts where bar starts at floor).
  */
 export function detectMarkerAuto(frames: ExtractedFrame[]): AutoDetectResult | null {
   if (frames.length < 4) return null;
@@ -27,7 +27,6 @@ export function detectMarkerAuto(frames: ExtractedFrame[]): AutoDetectResult | n
   const h = frames[0].imageData.height;
   const motion = new Float32Array(w * h);
 
-  // Sample frame pairs evenly across the video — every Nth frame
   const targetSamples = Math.min(12, frames.length - 1);
   const stride = Math.max(1, Math.floor((frames.length - 1) / targetSamples));
 
@@ -37,11 +36,9 @@ export function detectMarkerAuto(frames: ExtractedFrame[]): AutoDetectResult | n
     const b = frames[i].imageData.data;
     for (let p = 0; p < w * h; p++) {
       const idx = p * 4;
-      // Grayscale (luminance) — Rec.601 weights
       const la = 0.299 * a[idx] + 0.587 * a[idx + 1] + 0.114 * a[idx + 2];
       const lb = 0.299 * b[idx] + 0.587 * b[idx + 1] + 0.114 * b[idx + 2];
       const d = Math.abs(la - lb);
-      // Threshold low-noise pixels to ignore lighting flicker
       if (d > 8) motion[p] += d;
     }
     pairs++;
@@ -49,7 +46,6 @@ export function detectMarkerAuto(frames: ExtractedFrame[]): AutoDetectResult | n
 
   if (pairs === 0) return null;
 
-  // Build an integral image for fast box-sum queries
   const integral = new Float64Array(w * h);
   for (let y = 0; y < h; y++) {
     let row = 0;
@@ -66,7 +62,6 @@ export function detectMarkerAuto(frames: ExtractedFrame[]): AutoDetectResult | n
     return D - B - C + A;
   };
 
-  // Use a box approximately the size of a plate (5% of min dimension)
   const boxHalf = Math.max(14, Math.floor(Math.min(w, h) * 0.04));
   const stepX = Math.max(2, Math.floor(w / 200));
   const stepY = Math.max(2, Math.floor(h / 200));
@@ -85,14 +80,40 @@ export function detectMarkerAuto(frames: ExtractedFrame[]): AutoDetectResult | n
     }
   }
 
-  // Confidence = peak-to-mean ratio (how concentrated is the motion?)
   let total = 0;
   for (let p = 0; p < motion.length; p++) total += motion[p];
   const meanPerPixel = total / motion.length;
   const peakPerPixel = bestScore / ((boxHalf * 2) * (boxHalf * 2));
   const motionConfidence = Math.min(1, peakPerPixel / Math.max(meanPerPixel * 6, 8));
 
-  // Try to detect a plate-shaped circle around the seed
+  // Find the frame with peak local motion at the detected seed.
+  // This is the frame where the bar is most actively passing through (bestX, bestY),
+  // giving us a reliable template for bidirectional tracking.
+  let bestLocalScore = -1;
+  let seedFrameIdx = Math.floor(frames.length / 2);
+  const lx0 = Math.max(0, Math.round(bestX) - boxHalf);
+  const ly0 = Math.max(0, Math.round(bestY) - boxHalf);
+  const lx1 = Math.min(w - 1, Math.round(bestX) + boxHalf);
+  const ly1 = Math.min(h - 1, Math.round(bestY) + boxHalf);
+  for (let fi = stride; fi < frames.length; fi += stride) {
+    const a = frames[fi - stride].imageData.data;
+    const b = frames[fi].imageData.data;
+    let localSum = 0;
+    for (let y = ly0; y <= ly1; y++) {
+      for (let x = lx0; x <= lx1; x++) {
+        const idx = (y * w + x) * 4;
+        const la = 0.299 * a[idx] + 0.587 * a[idx + 1] + 0.114 * a[idx + 2];
+        const lb = 0.299 * b[idx] + 0.587 * b[idx + 1] + 0.114 * b[idx + 2];
+        const d = Math.abs(la - lb);
+        if (d > 8) localSum += d;
+      }
+    }
+    if (localSum > bestLocalScore) {
+      bestLocalScore = localSum;
+      seedFrameIdx = fi;
+    }
+  }
+
   const midFrame = frames[Math.floor(frames.length / 2)];
   const plate = detectPlateCircle(midFrame.imageData, bestX, bestY);
 
@@ -106,6 +127,7 @@ export function detectMarkerAuto(frames: ExtractedFrame[]): AutoDetectResult | n
   return {
     seedX: bestX,
     seedY: bestY,
+    seedFrameIdx,
     plateRadiusPixels: plate?.radius ?? null,
     motionConfidence,
     plateConfidence: plate?.confidence ?? 0,
@@ -118,14 +140,6 @@ interface PlateCircle {
   confidence: number;
 }
 
-/**
- * Simple plate circle detector: scans concentric rings around (cx, cy) and
- * finds the radius with the strongest inner/outer luminance contrast.
- *
- * Works best when the plate is reasonably side-on (round, not heavily
- * elliptical) and has decent contrast against the background. Designed to
- * be fast — single pass, no Hough accumulator.
- */
 function detectPlateCircle(imageData: ImageData, cx: number, cy: number): PlateCircle | null {
   const w = imageData.width;
   const h = imageData.height;
@@ -167,10 +181,8 @@ function detectPlateCircle(imageData: ImageData, cx: number, cy: number): PlateC
     }
   }
 
-  // Edge contrast threshold — below this the "circle" is too weak to trust
   if (bestScore < 18 || bestR < 0) return null;
 
-  // Confidence: 0 at score 18 → ~1 at score 60+
   const confidence = Math.min(1, (bestScore - 18) / 42);
   return { radius: bestR, confidence };
 }
