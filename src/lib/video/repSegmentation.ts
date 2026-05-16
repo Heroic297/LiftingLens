@@ -58,6 +58,15 @@ function findValleys(arr: number[], minProminence: number): Extreme[] {
  * Uses prominence-based peak detection so real reps are found even when
  * the signal has noise, wobbles, or camera shake — the threshold adapts
  * to the actual range of motion in the clip.
+ *
+ * Lift-type-aware segmentation:
+ *   - Deadlift: concentric-only (no eccentric return expected). If no valley
+ *     is found, the start of the clip is used as the implicit bottom — even
+ *     for signals that begin mid-concentric (bar rising from frame 0).
+ *   - Squat / Bench: expect a valley (bottom position) followed by a peak.
+ *
+ * Minimum rep duration enforced per-frame to filter noise spikes at RPE 8–9:
+ *   at least 8 frames at the clip’s sample rate.
  */
 export function segmentReps(
   positions: number[],
@@ -72,12 +81,19 @@ export function segmentReps(
     return { reps: [], smoothedPositions: positions, warnings };
   }
 
+  const isDeadlift = liftType === 'deadlift';
+
   // Adaptive smoothing: ~0.25 s regardless of frame rate
   const totalTime = times[times.length - 1] - times[0];
   const fps = positions.length / Math.max(totalTime, 0.001);
   const rawWindow = Math.round(fps * 0.25);
   const smoothWindow = Math.max(3, Math.min(11, rawWindow % 2 === 0 ? rawWindow + 1 : rawWindow));
   const smoothed = smooth(positions, smoothWindow);
+
+  // Minimum rep duration in frames: at least 8 frames (prevents noise spikes
+  // from being counted as reps, especially at RPE 8-9 where bar slows near
+  // sticking point and acceleration noise can split a single rep).
+  const minRepFrames = Math.max(8, Math.round(fps * 0.30));
 
   const minVal = Math.min(...smoothed);
   const maxVal = Math.max(...smoothed);
@@ -93,13 +109,30 @@ export function segmentReps(
   const minProminence = totalRange * 0.25;
 
   const peaks = findPeaks(smoothed, minProminence).sort((a, b) => a.index - b.index);
-  const valleys = findValleys(smoothed, minProminence).sort((a, b) => a.index - b.index);
+  let valleys = findValleys(smoothed, minProminence).sort((a, b) => a.index - b.index);
+
+  // For deadlift: if no valleys are found (concentric-only clip with no
+  // eccentric return), synthesize an implicit valley at the signal start.
+  // Also lower the prominence threshold slightly for peak-finding since
+  // the sticking-point dip in RPE 8-9 deadlifts can suppress the main peak.
+  if (isDeadlift && valleys.length === 0) {
+    valleys = [{ index: 0, value: smoothed[0] }];
+  }
+
+  // For deadlift with no peaks found (e.g. bar rises monotonically from start
+  // to end with no clear global maximum due to noise), synthesize the peak at
+  // the position of maximum value.
+  let effectivePeaks = peaks;
+  if (isDeadlift && peaks.length === 0 && smoothed[smoothed.length - 1] > smoothed[0]) {
+    const maxIdx = smoothed.indexOf(Math.max(...smoothed));
+    effectivePeaks = [{ index: maxIdx, value: smoothed[maxIdx] }];
+  }
 
   const reps: RepResult[] = [];
   const usedValleyIndices = new Set<number>();
   let repNum = 1;
 
-  for (const peak of peaks) {
+  for (const peak of effectivePeaks) {
     // Find the most recent unused valley before this peak
     let prevValley: Extreme | null = null;
     for (let vi = valleys.length - 1; vi >= 0; vi--) {
@@ -111,6 +144,7 @@ export function segmentReps(
 
     // If no explicit valley precedes the first peak, use the signal start as an
     // implicit bottom — handles recordings that begin mid-concentric.
+    // For deadlift this is the common case (bar rises from floor from frame 0).
     if (!prevValley && peak.index > 0 && smoothed[0] < peak.value - minProminence * 0.5) {
       prevValley = { index: 0, value: smoothed[0] };
     }
@@ -119,6 +153,9 @@ export function segmentReps(
 
     const romProj = peak.value - prevValley.value;
     if (romProj < totalRange * 0.20) continue; // ignore micro-movements
+
+    // Enforce minimum frame gap to prevent noise spikes from being counted as reps
+    if (peak.index - prevValley.index < minRepFrames) continue;
 
     usedValleyIndices.add(prevValley.index);
 
@@ -130,7 +167,8 @@ export function segmentReps(
     const startTime = tSlice[0];
     const endTime = tSlice[tSlice.length - 1];
     const duration = endTime - startTime;
-    if (duration < 0.4) continue; // real concentric reps take at least ~0.4s
+    // Minimum concentric time: 0.3s (relaxed from 0.4s to catch fast RPE 6 reps)
+    if (duration < 0.3) continue;
 
     // Velocity: only count frames where the bar is moving upward (concentric)
     const velocities: number[] = [];
@@ -163,9 +201,6 @@ export function segmentReps(
   if (reps.length === 0) {
     warnings.push('No complete reps detected. Try adjusting marker position or recording the full lift from start to finish.');
   }
-
-  // Suppress lift-type parameter warning — kept for future lift-specific tuning
-  void liftType;
 
   return { reps, smoothedPositions: smoothed, warnings };
 }

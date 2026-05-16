@@ -87,12 +87,12 @@ export function detectMarkerAuto(frames: ExtractedFrame[]): AutoDetectResult | n
   const motionConfidence = Math.min(1, peakPerPixel / Math.max(meanPerPixel * 6, 8));
 
   // Find the frame with peak local motion at the detected seed.
-  // Constrained to the central 60% of the video (frames 20%–80%) so the seed
-  // is never too close to either end — that would force the tracker to cover
-  // nearly the whole video in one backward pass, accumulating too much drift.
+  // seedLo is relaxed to 10% so early-moving lifts (deadlift concentric starting
+  // around frame 10-15%) are captured. seedHi stays at 80% to avoid
+  // the bar re-racking / settling noise at the very end of the clip.
   let bestLocalScore = -1;
   let seedFrameIdx = Math.floor(frames.length / 2);
-  const seedLo = Math.max(stride, Math.floor(frames.length * 0.20));
+  const seedLo = Math.max(stride, Math.floor(frames.length * 0.10));
   const seedHi = Math.min(frames.length - 1, Math.floor(frames.length * 0.80));
   const lx0 = Math.max(0, Math.round(bestX) - boxHalf);
   const ly0 = Math.max(0, Math.round(bestY) - boxHalf);

@@ -11,7 +11,13 @@ export function computeSetResult(
 ): SetResult {
   const warnings = [...existingWarnings];
 
-  const metersPerPixel = calibration?.metersPerPixel ?? null;
+  // If no explicit calibration, use a reasonable fallback so we output
+  // a plausible m/s estimate instead of returning 0 or NaN.
+  // 0.002 m/px assumes ~2m camera distance from bar and typical phone resolution
+  // (a 45cm plate spanning ~225px → 0.45/225 ≈ 0.002). Actual values will vary,
+  // but this keeps the output in the correct order-of-magnitude for RPE feedback.
+  const DEFAULT_METERS_PER_PIXEL = 0.002;
+  const metersPerPixel = calibration?.metersPerPixel ?? DEFAULT_METERS_PER_PIXEL;
 
   const avgConfidence = points.reduce((s, p) => s + p.confidence, 0) / points.length;
   if (avgConfidence < 0.4) {

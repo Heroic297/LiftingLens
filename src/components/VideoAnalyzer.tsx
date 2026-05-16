@@ -15,45 +15,119 @@ interface VideoAnalyzerProps {
 type Stage = 'idle' | 'extracting' | 'detecting' | 'tracking' | 'computing' | 'manual';
 
 /**
- * Infer lift type from the 2D tracked trajectory.
+ * Infer lift type from the 2D tracked trajectory using a multi-feature scoring approach.
  *
- * Portrait-mode videos (phone held vertically) store pixel data rotated 90° —
- * the browser ignores the rotation metadata, so "up in the gym" maps to
- * "left or right" in pixel space. We detect this and use the X axis instead of Y.
+ * Portrait-mode videos: phones held vertically store pixel data rotated 90° — modern
+ * browsers apply the rotation matrix when drawing to canvas, so frameH > frameW for
+ * portrait clips. In that case "up in the gym" = decreasing X in pixel space, and we
+ * use X values with dim = frameW for all relative calculations.
+ *
+ * Biomechanical signatures (all in portrait X / landscape Y, "higher value = lower position"):
+ *   Deadlift  — bar starts LOW (high relVal in first 20%), moves upward monotonically,
+ *               few direction reversals.
+ *   Bench     — bar stays in mid-to-upper frame (low relMean), short total ROM.
+ *   Squat     — bar starts high, descends and returns (two direction reversals),
+ *               medium relMean.
+ *
+ * Each lift type is scored 0–3 on its distinguishing features; highest score wins.
+ * Ties are broken by relMean.
  */
 function classifyLiftType(points: TrackedPoint[], frameW: number, frameH: number): LiftType {
   if (points.length < 5) return 'squat';
 
   const isPortrait = frameH > frameW * 1.2;
 
-  // For portrait videos the bar moves horizontally; use X values.
-  // For landscape videos the bar moves vertically; use Y values.
+  // "vals" increases as the bar moves downward in the gym in both orientations.
+  // Portrait: raw X increases leftward on a -90° rotated phone = downward in gym.
+  // Landscape: raw Y increases downward in frame = downward in gym.
   const vals = isPortrait ? points.map((p) => p.x) : points.map((p) => p.y);
   const dim = isPortrait ? frameW : frameH;
 
-  const meanVal = vals.reduce((a, b) => a + b, 0) / vals.length;
+  const n = vals.length;
+  const meanVal = vals.reduce((a, b) => a + b, 0) / n;
   const minVal = Math.min(...vals);
   const maxVal = Math.max(...vals);
   const range = maxVal - minVal;
 
-  // In both orientations: higher value = lower position in the gym
-  // (image Y increases downward; portrait X also increases away from "up" side)
   const relMean = meanVal / dim;
   const relRange = range / dim;
 
-  // Dwell fraction: time spent near the "bottom" of the bar's own range
-  const dwellThresh = maxVal - range * 0.15;
-  const dwellFrac = vals.filter((v) => v >= dwellThresh).length / vals.length;
+  // Bar position in the first 20% of the clip ("start" position)
+  const startN = Math.max(1, Math.floor(n * 0.20));
+  const startMean = vals.slice(0, startN).reduce((a, b) => a + b, 0) / startN;
+  const startRel = startMean / dim;
 
-  if (relMean > 0.58 || (relMean > 0.44 && dwellFrac > 0.25 && relRange > 0.12)) {
-    return 'deadlift';
+  // Dwell fraction: time spent near the bottom of the bar's own range
+  const dwellThresh = maxVal - range * 0.15;
+  const dwellFrac = vals.filter((v) => v >= dwellThresh).length / n;
+
+  // Direction reversals: count sign changes in the smoothed derivative
+  // (robust to noise — only count reversals where |delta| > 1% of range)
+  const deltaThresh = Math.max(range * 0.01, 1);
+  const signs: number[] = [];
+  for (let i = 1; i < n; i++) {
+    const d = vals[i] - vals[i - 1];
+    if (Math.abs(d) > deltaThresh) signs.push(Math.sign(d));
   }
-  if (relMean < 0.28 && relRange > 0.10) {
-    return 'overhead_press';
+  let reversals = 0;
+  for (let i = 1; i < signs.length; i++) {
+    if (signs[i] !== signs[i - 1]) reversals++;
   }
-  if (relRange < 0.14 && relMean > 0.35 && relMean < 0.65) {
-    return 'bench';
+
+  // ── Scoring ──────────────────────────────────────────────────────────────
+  // Each lift type accumulates points on its biomechanical features.
+  // Score range per feature: 0 (absent) or 1 (present).
+  // Max score = 3 per lift type.
+
+  let dlScore = 0;
+  let benchScore = 0;
+  let squatScore = 0;
+
+  // Deadlift features:
+  //   1. Bar starts low (near floor) in the first 20% of the clip
+  if (startRel > 0.48) dlScore++;
+  //   2. Bar spends significant time near its lowest point (dwell at bottom)
+  if (dwellFrac > 0.20) dlScore++;
+  //   3. Relatively few direction reversals (predominantly concentric-only)
+  if (reversals <= 4) dlScore++;
+
+  // Bench features:
+  //   1. Bar stays in the upper portion of the frame (bar is high, near chest)
+  if (relMean < 0.40) benchScore++;
+  //   2. Bar starts in upper frame
+  if (startRel < 0.40) benchScore++;
+  //   3. Short ROM relative to frame — bench has smallest ROM of the three
+  if (relRange < 0.25) benchScore++;
+
+  // Squat features:
+  //   1. Bar starts high (on shoulders) — relMean in mid range
+  if (startRel < 0.48 && startRel > 0.25) squatScore++;
+  //   2. Medium overall relMean (bar stays in mid frame)
+  if (relMean > 0.30 && relMean < 0.55) squatScore++;
+  //   3. Multiple direction reversals (eccentric descent + concentric ascent)
+  if (reversals >= 2) squatScore++;
+
+  // Overhead press: bar is in the very top of frame (above head). Use relMean < 0.22
+  // to avoid misclassifying a high bench or close-camera squat as OHP.
+  if (relMean < 0.22 && relRange > 0.10) return 'overhead_press';
+
+  // Pick highest score; break ties by relMean
+  const best = Math.max(dlScore, benchScore, squatScore);
+  if (best === 0) {
+    // No clear winner — use relMean as tiebreaker
+    if (relMean > 0.55) return 'deadlift';
+    if (relMean < 0.35) return 'bench';
+    return 'squat';
   }
+
+  // Resolve ties: prefer the lift whose relMean best matches expected position
+  if (dlScore === best && benchScore !== best && squatScore !== best) return 'deadlift';
+  if (benchScore === best && dlScore !== best && squatScore !== best) return 'bench';
+  if (squatScore === best && dlScore !== best && benchScore !== best) return 'squat';
+
+  // Multi-way tie: use relMean
+  if (relMean > 0.50) return 'deadlift';
+  if (relMean < 0.35) return 'bench';
   return 'squat';
 }
 
@@ -243,7 +317,7 @@ export function VideoAnalyzer({ onComplete }: VideoAnalyzerProps) {
         warnings.push('Auto-detection confidence was moderate — verify the marker on the frame and re-analyze manually if needed.');
       }
       if (!activeCalibration) {
-        warnings.push('No calibration — velocity is in relative units. Tap "Calibrate" on results for m/s.');
+        warnings.push('No calibration — using estimated scale (0.002 m/px). Tap "Calibrate" for accurate m/s.');
       }
 
       const result = computeSetResult(points, inferredLift, activeCalibration, warnings);
@@ -302,7 +376,7 @@ export function VideoAnalyzer({ onComplete }: VideoAnalyzerProps) {
       await new Promise((r) => setTimeout(r, 16));
 
       const warnings: string[] = [];
-      if (!calibration) warnings.push('No calibration — velocity is in relative units.');
+      if (!calibration) warnings.push('No calibration — using estimated scale (0.002 m/px). Tap "Calibrate" for accurate m/s.');
 
       const result = computeSetResult(points, selectedLift, calibration, warnings);
       setCurrentSetResult(result);
