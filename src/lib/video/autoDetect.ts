@@ -87,10 +87,13 @@ export function detectMarkerAuto(frames: ExtractedFrame[]): AutoDetectResult | n
   const motionConfidence = Math.min(1, peakPerPixel / Math.max(meanPerPixel * 6, 8));
 
   // Find the frame with peak local motion at the detected seed.
-  // This is the frame where the bar is most actively passing through (bestX, bestY),
-  // giving us a reliable template for bidirectional tracking.
+  // Constrained to the central 60% of the video (frames 20%–80%) so the seed
+  // is never too close to either end — that would force the tracker to cover
+  // nearly the whole video in one backward pass, accumulating too much drift.
   let bestLocalScore = -1;
   let seedFrameIdx = Math.floor(frames.length / 2);
+  const seedLo = Math.max(stride, Math.floor(frames.length * 0.20));
+  const seedHi = Math.min(frames.length - 1, Math.floor(frames.length * 0.80));
   const lx0 = Math.max(0, Math.round(bestX) - boxHalf);
   const ly0 = Math.max(0, Math.round(bestY) - boxHalf);
   const lx1 = Math.min(w - 1, Math.round(bestX) + boxHalf);
@@ -108,7 +111,8 @@ export function detectMarkerAuto(frames: ExtractedFrame[]): AutoDetectResult | n
         if (d > 8) localSum += d;
       }
     }
-    if (localSum > bestLocalScore) {
+    // Only update seedFrameIdx when this frame-pair falls in the central zone
+    if (localSum > bestLocalScore && fi >= seedLo && fi <= seedHi) {
       bestLocalScore = localSum;
       seedFrameIdx = fi;
     }

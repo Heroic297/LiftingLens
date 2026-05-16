@@ -28,9 +28,12 @@ export function computeSetResult(
   if (axis.linearity < 3 && points.length > 10) {
     warnings.push('Bar motion appears non-linear — tracking may have drifted. Results are approximate.');
   }
-  if (axis.angleFromVertical > 25) {
+  // Only warn about camera angle when the motion is clearly off-axis but NOT
+  // close to horizontal — angles near 90° are expected for portrait-mode videos
+  // where the rotation metadata isn't applied, so we'd just confuse the user.
+  if (axis.angleFromVertical > 25 && axis.angleFromVertical < 70) {
     warnings.push(
-      `Bar path is ${axis.angleFromVertical.toFixed(0)}° from vertical. For best accuracy, position the camera perpendicular to the bar's direction of travel.`,
+      `Bar path is ${axis.angleFromVertical.toFixed(0)}° from vertical. For best accuracy, position the camera side-on to the lift.`,
     );
   }
 

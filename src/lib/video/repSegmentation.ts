@@ -88,9 +88,9 @@ export function segmentReps(
     return { reps: [], smoothedPositions: smoothed, warnings };
   }
 
-  // Prominence threshold: 30% of observed range.
-  // Real reps easily exceed this; breathing wobbles and drift do not.
-  const minProminence = totalRange * 0.30;
+  // Prominence threshold: 25% of observed range.
+  // Real reps easily exceed this; breathing wobbles and small drift do not.
+  const minProminence = totalRange * 0.25;
 
   const peaks = findPeaks(smoothed, minProminence).sort((a, b) => a.index - b.index);
   const valleys = findValleys(smoothed, minProminence).sort((a, b) => a.index - b.index);
@@ -130,7 +130,7 @@ export function segmentReps(
     const startTime = tSlice[0];
     const endTime = tSlice[tSlice.length - 1];
     const duration = endTime - startTime;
-    if (duration < 0.1) continue; // skip sub-100ms spurious events
+    if (duration < 0.4) continue; // real concentric reps take at least ~0.4s
 
     // Velocity: only count frames where the bar is moving upward (concentric)
     const velocities: number[] = [];

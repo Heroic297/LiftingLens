@@ -16,39 +16,44 @@ type Stage = 'idle' | 'extracting' | 'detecting' | 'tracking' | 'computing' | 'm
 
 /**
  * Infer lift type from the 2D tracked trajectory.
- * Uses bar mean position in frame + dwell time at the bottom of the range.
+ *
+ * Portrait-mode videos (phone held vertically) store pixel data rotated 90° —
+ * the browser ignores the rotation metadata, so "up in the gym" maps to
+ * "left or right" in pixel space. We detect this and use the X axis instead of Y.
  */
-function classifyLiftType(points: TrackedPoint[], frameHeight: number): LiftType {
+function classifyLiftType(points: TrackedPoint[], frameW: number, frameH: number): LiftType {
   if (points.length < 5) return 'squat';
 
-  const yValues = points.map((p) => p.y);
-  const meanY = yValues.reduce((a, b) => a + b, 0) / yValues.length;
-  const minY = Math.min(...yValues);
-  const maxY = Math.max(...yValues);
-  const rangeY = maxY - minY;
+  const isPortrait = frameH > frameW * 1.2;
 
-  const relMeanY = meanY / frameHeight; // 0 = top, 1 = bottom of image
-  const relRangeY = rangeY / frameHeight;
+  // For portrait videos the bar moves horizontally; use X values.
+  // For landscape videos the bar moves vertically; use Y values.
+  const vals = isPortrait ? points.map((p) => p.x) : points.map((p) => p.y);
+  const dim = isPortrait ? frameW : frameH;
 
-  // Dwell: fraction of frames where bar is in bottom 15% of its own range
-  const dwellThresh = maxY - rangeY * 0.15;
-  const dwellFrac = yValues.filter((y) => y >= dwellThresh).length / yValues.length;
+  const meanVal = vals.reduce((a, b) => a + b, 0) / vals.length;
+  const minVal = Math.min(...vals);
+  const maxVal = Math.max(...vals);
+  const range = maxVal - minVal;
 
-  // Deadlift: bar sits in the lower part of frame, or clear dwell at the floor position
-  if (relMeanY > 0.58 || (relMeanY > 0.44 && dwellFrac > 0.25 && relRangeY > 0.12)) {
+  // In both orientations: higher value = lower position in the gym
+  // (image Y increases downward; portrait X also increases away from "up" side)
+  const relMean = meanVal / dim;
+  const relRange = range / dim;
+
+  // Dwell fraction: time spent near the "bottom" of the bar's own range
+  const dwellThresh = maxVal - range * 0.15;
+  const dwellFrac = vals.filter((v) => v >= dwellThresh).length / vals.length;
+
+  if (relMean > 0.58 || (relMean > 0.44 && dwellFrac > 0.25 && relRange > 0.12)) {
     return 'deadlift';
   }
-
-  // Overhead press: bar consistently high in frame with meaningful ROM
-  if (relMeanY < 0.28 && relRangeY > 0.10) {
+  if (relMean < 0.28 && relRange > 0.10) {
     return 'overhead_press';
   }
-
-  // Bench: small ROM relative to frame height, bar at mid-frame
-  if (relRangeY < 0.14 && relMeanY > 0.35 && relMeanY < 0.65) {
+  if (relRange < 0.14 && relMean > 0.35 && relMean < 0.65) {
     return 'bench';
   }
-
   return 'squat';
 }
 
@@ -187,28 +192,44 @@ export function VideoAnalyzer({ onComplete }: VideoAnalyzerProps) {
       setAnalysisProgress(70);
       await new Promise((r) => setTimeout(r, 16));
 
+      const frameW = frames[0].imageData.width;
+      const frameH = frames[0].imageData.height;
+
+      // Portrait-mode videos (phone held vertically) store pixel data in landscape
+      // orientation internally — the browser reads raw pixels without applying the
+      // rotation metadata. This means "up in the gym" = left/right in pixel space.
+      // We swap the tracker's horizontal/vertical search radii so it searches widely
+      // in the actual direction of motion.
+      const isPortrait = frameH > frameW * 1.2;
+      // Portrait: wide horizontal search (bar moves mostly left/right in raw pixels),
+      // narrow vertical (prevents drift perpendicular to motion).
+      const trackOpts = isPortrait
+        ? { horizontalRadius: 80, verticalRadius: 30 }
+        : {};
+
       // Bidirectional tracking from the frame where bar motion peaks at the
       // detected seed. This ensures the template is always of the bar itself,
       // not background — critical when bar starts at a different height (deadlift).
       let points: TrackedPoint[];
       const seedIdx = auto.seedFrameIdx;
       if (seedIdx <= 1) {
-        points = trackMarker(frames, auto.seedX, auto.seedY, settings.markerSearchRadius);
+        points = trackMarker(frames, auto.seedX, auto.seedY, settings.markerSearchRadius, trackOpts);
       } else {
         const forwardFrames = frames.slice(seedIdx);
         const backwardFrames = frames.slice(0, seedIdx + 1).reverse();
 
-        const fwd = trackMarker(forwardFrames, auto.seedX, auto.seedY, settings.markerSearchRadius);
-        const bwd = trackMarker(backwardFrames, auto.seedX, auto.seedY, settings.markerSearchRadius);
+        const fwd = trackMarker(forwardFrames, auto.seedX, auto.seedY, settings.markerSearchRadius, trackOpts);
+        const bwd = trackMarker(backwardFrames, auto.seedX, auto.seedY, settings.markerSearchRadius, trackOpts);
         bwd.reverse();
 
         // bwd covers [0..seedIdx], fwd covers [seedIdx..end]. Drop the duplicate seedFrame.
         points = [...bwd.slice(0, -1), ...fwd];
       }
 
-      // Infer lift type from the trajectory, auto-select in the store
-      const frameH = frames[0].imageData.height;
-      const inferredLift = classifyLiftType(points, frameH);
+      // Infer lift type from the trajectory.
+      // For portrait videos, bar motion is horizontal in pixel space —
+      // use X position relative to frame width rather than Y/height.
+      const inferredLift = classifyLiftType(points, frameW, frameH);
       setDetectedLift(inferredLift);
       setLift(inferredLift);
 
@@ -270,7 +291,10 @@ export function VideoAnalyzer({ onComplete }: VideoAnalyzerProps) {
       setStageLabel('Tracking motion…');
       setAnalysisProgress(70);
       await new Promise((r) => setTimeout(r, 16));
-      const points = trackMarker(frames, manualPos.x, manualPos.y, settings.markerSearchRadius);
+      const mfW = frames[0].imageData.width;
+      const mfH = frames[0].imageData.height;
+      const mOpts = mfH > mfW * 1.2 ? { horizontalRadius: 80, verticalRadius: 30 } : {};
+      const points = trackMarker(frames, manualPos.x, manualPos.y, settings.markerSearchRadius, mOpts);
 
       setStage('computing');
       setStageLabel('Computing velocity…');
